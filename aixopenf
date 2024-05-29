@@ -1,0 +1,340 @@
+#!/usr/bin/ksh93
+#######################################################################
+# aixopenf - AIX Process-LV Display Tool
+#######################################################################
+# The purpose of this tool is to gather and display, for each Logical
+#   Volume, the running processes that have open files
+#
+# REQUIRES:
+#   0) aix_tools.ksh v1.02 or later
+#   1) Privileged Access
+#
+# NOTES:
+#   0) Because AIX does not have a native "grep" that supports
+#      context parameters (such as "-A" and "-B" in GNU "grep"),
+#      "nawk" is used to approximate the same feature if needed
+#   1) The AIX version of "grep" also does not support the "-m"
+#      parameter, so "sed <number>p" is used to emulate that
+#      function if needed
+#   2) The AIX version of "wc" has no way to limit the output to
+#      just the number of lines in the file, so "awk" must
+#      also be used to trim the output
+#   3) Only a JFS2 filesystem may be specified with the "-m"
+#      parameter
+#
+# KNOWN BUGS:
+#   0) Temporary files created will not be cleaned up if the script
+#      is killed before completion
+#   1) Does not verify all dependencies
+#
+# TO DO:
+#   0) If invoked with "-g" or "-m" or "-v", then exit as soon as
+#      I have processed the requested resource
+#   1) Add ability to find the filesystems where a specific process
+#      name, or user ID, has open files (basically,
+#      reverse the information order)
+#   2) Allow multiple targets to be specified with "-g",
+#      "-m" and "-v"
+#
+TOOL_VERSION='1.00'
+#######################################################################
+# Change Log (Reverse Chronological Order)
+# Who When______ What__________________________________________________
+# dxb 2018-09-08 Initial creation (v1.00)
+#######################################################################
+# Require minimum aix_tools.ksh
+MINIMUM_AIX_TOOLS_LIBRARY_VERSION=1.00
+TOOLS_FILE='/usr/local/lib/aix_tools.ksh'
+# Make sure it exists, is NOT 0-length, and is a regular file
+if [[ -e ${TOOLS_FILE} && -s ${TOOLS_FILE} && -f ${TOOLS_FILE} ]]; then
+  . ${TOOLS_FILE}
+else
+  print "\nFATAL ERROR: Unable to source a valid tool library (${TOOLS_FILE})\n"
+  exit 1
+fi
+# I have a valid TOOLS_FILE, so check the file version
+# IMPORTANT: This only works in ksh93, not ksh88 or bash
+if [[ "${AIX_TOOLS_LIBRARY_VERSION}" -lt "${MINIMUM_AIX_TOOLS_LIBRARY_VERSION}" ]]; then
+  print "\nFATAL ERROR: Outdated tool library (${TOOLS_FILE}) - found v${AIX_TOOLS_LIBRARY_VERSION} but need ${MINIMUM_AIX_TOOLS_LIBRARY_VERSION} or later\n"
+  exit 1
+else
+  # Initialize command-shortcut variables
+  _init_script_tool_names
+  # Emulate BASH built-in variables
+  _init_script_variables
+  # Set up variables to colorize text output
+  _init_script_colors
+fi
+
+# Default exit code
+EXIT_CODE=0
+
+# Definition for OUTPUT_MODE
+#   0 - Verbose (all output to stdout)
+#   1 - Quiet (limited output)
+OUTPUT_MODE=0
+
+# Temporary files
+TMP_FILE_A='/tmp/.LVMinfo'
+
+# Flag to control output when skipping
+SKIP_FLAG=0
+
+# Initialize command-line flags
+DEBUG='NO'
+HELP_FLAG='NO'
+TARGET_MOUNT=''
+TARGET_LV=''
+TARGET_VG=''
+UNKNOWN='NO'
+# Command Line Argument Processing
+while getopts 'g:m:v:dh' OPT; do
+  case ${OPT} in
+    d)  DEBUG='YES'
+        # Also force output to screen
+        OUTPUT_MODE=0
+        ;;
+    g)  TARGET_VG="${OPTARG}"
+        ;;
+    m)  TARGET_MOUNT="${OPTARG}"
+        ;;
+    v)  TARGET_LV="${OPTARG}"
+        ;;
+    h)  HELP_FLAG='YES';;
+    *)  UNKNOWN='YES' ;;
+  esac
+done
+
+# Help Screen
+HELP="
+${0} - ${BOLD_TEXT}AIX Process-LV Display Tool v${TOOL_VERSION}${ALL_OFF}
+
+\t${BOLD_TEXT}Usage :${ALL_OFF} ${0} [ [ -d ] [ -g <VOLUME_GROUP> | -m </MOUNT/POINT> | -v <LOGICAL_VOLUME> ] | -h ]${ALL_OFF}
+\t${BOLD_TEXT}Syntax:${ALL_OFF}
+
+\t\t${BOLD_TEXT}-d${ALL_OFF} --> Debug mode; write debugging messages to ${BOLD_TEXT}stdout${ALL_OFF}
+
+\t\t${BOLD_TEXT}-g <VOLUME_GROUP>${ALL_OFF} --> Limit display to only those filesystems in this one VG
+\t\t\t(Conflicts with the ${BOLD_TEXT}-m${ALL_OFF} and ${BOLD_TEXT}-v${ALL_OFF} flags)
+\t\t\tEXAMPLE: ${BOLD_TEXT}${0} -g rootvg${ALL_OFF}
+
+\t\t${BOLD_TEXT}-h${ALL_OFF} --> Show this help screen and exit
+
+\t\t${BOLD_TEXT}-m </MOUNT/POINT>${ALL_OFF} --> Only display the filesystem at this mount-point
+\t\t\tThe mount-point must be a ${BOLD_TEXT}jfs2${ALL_OFF} filesystem
+\t\t\t(Conflicts with the ${BOLD_TEXT}-g${ALL_OFF} and ${BOLD_TEXT}-v${ALL_OFF} flags)
+\t\t\tEXAMPLE: ${BOLD_TEXT}${0} -m /usr/local${ALL_OFF}
+
+\t\t${BOLD_TEXT}-v <LOGICAL_VOLUME>${ALL_OFF} --> Limit display to this specific Logical Volume
+\t\t\t(Conflicts with the ${BOLD_TEXT}-g${ALL_OFF} and ${BOLD_TEXT}-m${ALL_OFF} flags)
+\t\t\tEXAMPLE: ${BOLD_TEXT}${0} -v usrloclv${ALL_OFF}
+
+\tArguments are optional
+\t${BOLD_TEXT}Found ${GREEN_BLACK}${TOOLS_FILE}${ALL_OFF} ${BOLD_TEXT}v${AIX_TOOLS_LIBRARY_VERSION}${ALL_OFF}
+\tOnly ${BOLD_TEXT}jfs2${ALL_OFF} filesystems may be specified with the ${BOLD_TEXT}-m${ALL_OFF} flag
+"
+
+# Check to see if user is privileged
+# The EUID variable was populated by _init_script_variables
+if [[ "${EUID}" -ne 0 ]]; then
+  print "\n${BOLD_TEXT}${MAGENTA_BLACK}FATAL ERROR:${RED_BLACK} Privilege is required to run this tool${ALL_OFF}\n"
+  HELP_FLAG='YES'
+  EXIT_CODE=1
+else
+  # If not in Quiet Mode and not invoked with "-h", print banner
+  if [[ "${OUTPUT_MODE}" -eq 0 && "${HELP_FLAG}" == 'NO' ]]; then
+    print "${0} - AIX Process-LV Display Tool v${SCRIPT_VERSION}"
+    print "\t\t${BOLD_TEXT}${GREEN_BLACK}Privileged status verified!${ALL_OFF}\n"
+  fi
+fi
+
+# If invoked with "-m", then it conflicts with "-g" and "-v"
+if [[ "${TARGET_MOUNT}" != '' ]]; then
+  if [[ "${TARGET_VG}" != '' || "${TARGET_LV}" != '' ]]; then
+    print "\n${BOLD_TEXT}${MAGENTA_BLACK}FATAL ERROR:${RED_BLACK} The ${ALL_OFF}${BOLD_TEXT}-m${RED_BLACK} flag conflicts with ${ALL_OFF}${BOLD_TEXT}-g${RED_BLACK} and ${ALL_OFF}${BOLD_TEXT}-v${ALL_OFF}\n"
+    HELP_FLAG='YES'
+    EXIT_CODE=1
+  else
+    # The first character of the string must be a '/' and I should
+    #   also be able to find the mount-point in the output from "mount"
+    # This substring construct requires ksh93 or bash
+    CHKSTR="${TARGET_MOUNT:0:1}"
+    if [[ "${CHKSTR}" == '/' ]]; then
+      # Note use of "-w"  *and*  a trailing space to ensure proper match
+      CHKVAL=$( ${MOUNT_TOOL} | ${GREP_TOOL} -c -w "${TARGET_MOUNT} " )
+      if [[ "${CHKVAL}" -eq 1 ]]; then
+        # It must be a filesystem I can analyze
+        CHKTYPE=$( ${MOUNT_TOOL} | ${GREP_TOOL} -w "${TARGET_MOUNT} " | ${AWK_TOOL} '{ print $3 }' )
+        if [[ "${CHKTYPE}" != 'jfs2' ]]; then
+          print "\n${BOLD_TEXT}${MAGENTA_BLACK}FATAL ERROR:${ALL_OFF} ${BOLD_TEXT}${TARGET_MOUNT}${RED_BLACK} is not a jfs2 mount point${ALL_OFF}\n"
+          HELP_FLAG='YES'
+          EXIT_CODE=1
+        fi
+      else
+        print "\n${BOLD_TEXT}${MAGENTA_BLACK}FATAL ERROR:${ALL_OFF} ${BOLD_TEXT}${TARGET_MOUNT}${RED_BLACK} is not a mount point${ALL_OFF}\n"
+        HELP_FLAG='YES'
+        EXIT_CODE=1
+      fi
+    else
+      print "\n${BOLD_TEXT}${MAGENTA_BLACK}FATAL ERROR:${ALL_OFF} ${BOLD_TEXT}${TARGET_MOUNT}${RED_BLACK} is not a mount point${ALL_OFF}\n"
+      HELP_FLAG='YES'
+      EXIT_CODE=1
+    fi
+    # End of if [[ "${CHKSTR}" == '/' ]]
+  fi
+  # End of if [[ "${TARGET_VG}" != '' || "${TARGET_LV}" != '' ]]
+else
+  # Not invoked with "-m"
+  # If invoked with "-g", then it conflicts with "-v"
+  if [[ "${TARGET_VG}" != '' ]]; then
+    if [[ "${TARGET_LV}" != '' ]]; then
+      print "\n${BOLD_TEXT}${MAGENTA_BLACK}FATAL ERROR:${RED_BLACK} The ${ALL_OFF}${BOLD_TEXT}-g${RED_BLACK} flag conflicts with ${ALL_OFF}${BOLD_TEXT}-v${ALL_OFF}\n"
+      HELP_FLAG='YES'
+      EXIT_CODE=1
+    else
+      # Invoked with "-g" - does the VG exist?
+      CHKSTR=$( ${VGS_TOOL} -o | ${GREP_TOOL} -c -w ${TARGET_VG} )
+      if [[ "${CHKSTR}" -ne 1 ]]; then
+        # The requested VG does not exist!
+        print "\n${BOLD_TEXT}${MAGENTA_BLACK}FATAL ERROR:${ALL_OFF}${BOLD_TEXT}${TARGET_VG}${RED_BLACK} is not a valid Volume Group${ALL_OFF}\n"
+        HELP_FLAG='YES'
+        EXIT_CODE=1
+      fi
+    fi
+  else
+    # Not invoked with "-g" or "-m"
+    if [[ "${TARGET_LV}" != '' ]]; then
+      # Invoked with -v
+      # I should be able to find the LV as a block device
+      if [[ ! -b /dev/${TARGET_LV} ]]; then
+        # It does NOT exist or is not a block device like it
+        #   should be
+        print "\n${BOLD_TEXT}${MAGENTA_BLACK}FATAL ERROR:${ALL_OFF}${BOLD_TEXT}${TARGET_LV}${RED_BLACK} is not a valid Logical Volume${ALL_OFF}\n"
+        HELP_FLAG='YES'
+        EXIT_CODE=1
+      fi
+    fi
+  fi
+  # End of if [[ "${TARGET_VG}" != '' ]]
+fi
+# End of if [[ "${TARGET_MOUNT}" != '' ]]
+
+# At this point, if HELP_FLAG is 'NO', then tool was not invoked
+#   with "-h" or an unknown parameter, AND
+#     - Also not invoked with more than one of "-g", "-m" and "-v"
+#     - If invoked with "-g", "-m" or "-v", then the argument was valid
+
+# If -h argument given, or an unknown/invalid argument was given,
+#   display help screen and exit
+if [[ "${HELP_FLAG}" == 'YES' || "${UNKNOWN}" == 'YES' ]]; then
+  print "${HELP}"
+  exit ${EXIT_CODE}
+fi
+
+# Get the short host name
+THIS_HOSTNAME=$( ${UNAME_TOOL} -n )
+
+###########################
+## Real Work Starts Here ##
+###########################
+if [[ "${OUTPUT_MODE}" -eq 0 ]]; then
+  print "\tChecking for Open Files on AIX host ${THIS_HOSTNAME}"
+fi
+
+# If invoked with "-g", then I just want one particular VG
+if [[ "${TARGET_VG}" != '' ]]; then
+  VG_LIST="${TARGET_VG}"
+else
+  # Start by gathering a list of the Volume Groups that have been
+  #  defined on this system; I also ensure that the universal
+  #  "rootvg" is at the top of the list
+  # NOTE: If I *always* expect "rootvg" to be present and want it
+  #       to be the first VG in the list, then I should simply put
+  #       "rootvg" in TMP_FILE_A and get any other VGs from VGS_TOOL;
+  #       this code design accounts for the possibility that
+  #       "rootvg" is not present (which I understand is
+  #       technically possible in AIX)
+  ${VGS_TOOL} -o | ${GREP_TOOL} -w rootvg > ${TMP_FILE_A}
+  ${VGS_TOOL} -o | ${GREP_TOOL} -v -w rootvg >> ${TMP_FILE_A}
+
+  # Dump file into a string I can use in a loop
+  VG_LIST=$( ${CAT_TOOL} ${TMP_FILE_A} | ${TR_TOOL} "\n" " " )
+  # I'm done with TMP_FILE_A, delete it
+  ${RM_TOOL} -f ${TMP_FILE_A}
+fi
+# End of if [[ "${TARGET_VG}" != '' ]]
+
+# Cycle through list of Volume Groups
+for VOL_GROUP in $( echo ${VG_LIST} ); do
+  print "\nVG Name : ${BOLD_TEXT}${VOL_GROUP}${ALL_OFF}"
+  # Get a list of the JFS filesystems on the LVs in this VG
+  #  Use "-w" to avoid the "jfs2log" filesystems, and
+  #  I only want the LV names (first field)
+  LOGICAL_VOLUME_LIST=$( ${VGS_TOOL} -l ${VOL_GROUP} | ${GREP_TOOL} -w jfs2 | ${AWK_TOOL} '{ print $1 }' )
+  if [[ "${DEBUG}" == 'YES' ]]; then
+    print "DEBUG: LOGICAL_VOLUME_LIST is ${LOGICAL_VOLUME_LIST}"
+  fi
+
+  # Make sure SKIP_FLAG is cleared for each VG
+  SKIP_FLAG=0
+
+  for LOGICAL_VOLUME in $( echo ${LOGICAL_VOLUME_LIST} ); do
+    if [[ "${DEBUG}" == 'YES' ]]; then
+      print "DEBUG: LOGICAL_VOLUME is ${LOGICAL_VOLUME}"
+    fi
+    # If invoked with "-v" and this is not the requested Logical
+    #   Volume, then skip it
+    if [[ "${TARGET_LV}" != '' ]]; then
+      if [[ "${LOGICAL_VOLUME}" != "${TARGET_LV}" ]]; then
+        if [[ "${SKIP_FLAG}" -eq 0 ]]; then
+          print "\tSkipping LV ${BOLD_TEXT}${LOGICAL_VOLUME}${ALL_OFF} as requested (invoked with ${BOLD_TEXT}-v${ALL_OFF})"
+          SKIP_FLAG=1
+        fi
+        continue
+      fi
+    fi
+
+    LV_MOUNT_POINT=$( ${VGS_TOOL} -l ${VOL_GROUP} | ${GREP_TOOL} -w ${LOGICAL_VOLUME} | ${AWK_TOOL} '{ print $7 }' )
+    # If invoked with "-m" and this is not the requested
+    #   filesystem, then skip it
+    if [[ "${TARGET_MOUNT}" != '' ]]; then
+      if [[ "${LV_MOUNT_POINT}" != "${TARGET_MOUNT}" ]]; then
+        if [[ "${SKIP_FLAG}" -eq 0 ]]; then
+          print "\tSkipping as requested (invoked with ${BOLD_TEXT}-m${ALL_OFF})"
+          SKIP_FLAG=1
+        fi
+        continue
+      fi
+    fi
+    LV_STATE=$( ${VGS_TOOL} -l ${VOL_GROUP} | ${GREP_TOOL} -w ${LOGICAL_VOLUME} | ${AWK_TOOL} '{ print $6 }' )
+
+    print "\tLV ${BOLD_TEXT}${LOGICAL_VOLUME}${ALL_OFF} mounted as ${BOLD_TEXT}${LV_MOUNT_POINT}${ALL_OFF} (State: ${LV_STATE})"
+    # Now get a list of Process IDs that have files open on this
+    #   Logical Volume; the re-direction ensures I just get the
+    #   PIDs, and also to avoid spurious characters that get
+    #   appended to the PIDs
+    LV_PID_LIST=$( ${FUSER_TOOL} /dev/${LOGICAL_VOLUME} 2>/dev/null )
+    # Did I get anything?
+    if [[ "${LV_PID_LIST}" != '' ]]; then
+      for THIS_PID in $( echo ${LV_PID_LIST} ); do
+        # Use "ps" to gather information about this process
+        #   If the process is gone, then I get a null string
+        PID_DATA=$( ${PS_TOOL} -o user=,pid=,tty=,args= -p ${THIS_PID} )
+        if [[ "${PID_DATA}" != '' ]]; then
+          # I have data!
+          print "\t\tPID Info: ${PID_DATA}"
+        fi
+      done
+      # End of for THIS_PID in $( echo ${LV_PID_LIST} )
+      print
+    else
+      # Nothing in the list!
+      print "\t\tNo files opened by a running process\n"
+    fi
+  done
+  # End of for LOGICAL_VOLUME in $( echo ${LOGICAL_VOLUME_LIST} )
+done
+# End of for VOL_GROUP in $( echo ${VG_LIST} )
+
+# End of aixopenf
+#################

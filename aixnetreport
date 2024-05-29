@@ -1,0 +1,573 @@
+#!/usr/bin/ksh93
+#######################################################################
+# aixnetreport - AIX Network Interface Reporting Tool
+#######################################################################
+# This tool examines "ent#" and "en#" interfaces on an AIX system,
+#   and reports IP addresses, link states, and other information
+#
+# REQUIRES:
+#   0) aix_tools.ksh v1.00 or later
+#   1) Privileged Access
+#   2) AIX v7.1 or later
+#
+# NOTES:
+#   0) Because AIX does not have a native "grep" that supports context
+#       parameters (such as "-A" and "-B" in GNU "grep"); t can take
+#       multiple invocations to extract specific information
+#   1) Link Status detection requires AIX 7.1 TL3 or later, and
+#       also requires that specific support has been enabled
+#	      in the OS; see https://www.ibm.com/developerworks/community/blogs/cgaix/entry/use_entstat_to_view_aix_virtual_ethernet_link_status?lang=en_us
+#   2) Does not detect or analyze "etX" interfaces (those using
+#       802.3 instead of standard Ethernet)
+#
+# KNOWN BUGS:
+#   0) DOES NOT WORK ON VIOs!!!
+#       It's not clear if that is due to the fact that the VIOs are
+#       just stripped-down "appliances" or if this tool is simply
+#       incompatible with AIX v6; running this on a VIO produces
+#       garbage output
+#   1) While the route table analysis nominally appears to support
+#       network spaces other than Class C, smaller or larger
+#       networks will cause erroneous route table analysis
+#   2) Does not verify all dependencies
+#   3) The code to detect multiple routes on a given "enX" interface
+#       has worked in testing, but is a bit kludgy and would probably
+#       benefit from a re-write; it also assumes Class C addressing
+#   4) Does not correctly handle host routes (specifically, those
+#       with an "H" flag)
+#
+# TO DO:
+#   0) Add verification of aix_tools.ksh version
+#   1) Add support for "et#" interfaces
+#   2) Add support for trunked/VLAN-tagged interfaces
+#
+TOOL_VERSION='1.00'
+#######################################################################
+# Change Log (Reverse Chronological Order)
+# Who When______ What__________________________________________________
+# dxb 2018-06-04 Initial creation (v1.00)
+#######################################################################
+# Require minimum aix_tools.ksh
+MINIMUM_AIX_TOOLS_LIBRARY_VERSION=1.00
+TOOLS_FILE='/usr/local/lib/aix_tools.ksh'
+# Make sure it exists, is NOT 0-length, and is a regular file
+if [[ -e ${TOOLS_FILE} && -s ${TOOLS_FILE} && -f ${TOOLS_FILE} ]]; then
+  . ${TOOLS_FILE}
+else
+  print "\nFATAL ERROR: Unable to source a valid tool library (${TOOLS_FILE})\n"
+  exit 1
+fi
+# I should have a valid TOOLS_FILE, so check the file version
+# IMPORTANT: This only works in ksh93, not ksh88 or bash
+if [[ "${AIX_TOOLS_LIBRARY_VERSION}" -lt "${MINIMUM_AIX_TOOLS_LIBRARY_VERSION}" ]]; then
+  print "\nFATAL ERROR: Outdated tool library (${TOOLS_FILE}) - found v${AIX_TOOLS_LIBRARY_VERSION} but need ${MINIMUM_AIX_TOOLS_LIBRARY_VERSION} or later\n"
+  exit 1
+else
+  # Initialize command-shortcut variables
+  _init_script_tool_names
+  # Emulate BASH built-in variables
+  _init_script_variables
+  # Set up variables to colorize text output
+  _init_script_colors
+fi
+
+# Other File locations
+HOST_FILE='/etc/hosts'
+
+# Number of PINGs in PING test
+NUM_PINGS=5
+
+HELP_FLAG='NO'
+NOPING='NO'
+UNKNOWN='NO'
+# Command Line Argument Processing
+while getopts ':nh' OPT; do
+  case ${OPT} in
+    n)  NOPING='YES' ;;
+    h)  HELP_FLAG='YES' ;;
+    *)  UNKNOWN='YES' ;;
+  esac
+done
+
+#######################################################################
+# Function: render_mac                                                #
+# Parameters: None (uses Global Variables instead)                    #
+# Local Variables: NUMBER, OCTETS, START, THIS_OCTET                  #
+# Global Variables: MAC_ADDR_RAW, MAC_ADDR                            #
+# Purpose: Takes a string containing a MAC address, but which lacks : #
+#       separating the octets, and renders it with a : between each   #
+#       octet                                                         #
+# Returns: Nothing (all data stored in Global variables)              #
+#######################################################################
+render_mac ()
+{
+  # MAC_ADDR_RAW should already contain the necessary string
+  OCTETS=6
+  START=0
+  MAC_ADDR=''
+  NUMBER=1
+  #print "MAC_ADDR_RAW is ${MAC_ADDR_RAW}"
+  while (( ${NUMBER} <= ${OCTETS} )); do
+    (( START = NUMBER - 1 ))
+    (( START = START * 2 ))
+    (( START = START + 1 ))
+    #print "START is ${START}"
+    THIS_OCTET=$( echo ${MAC_ADDR_RAW} | ${AWK_TOOL} -v start=${START} '{ print substr($1,start,2) }' )
+    #print "THIS_OCTET is ${THIS_OCTET}"
+    if [[ "${NUMBER}" -eq 1 ]]; then
+      MAC_ADDR="${THIS_OCTET}"
+    else
+      MAC_ADDR="${MAC_ADDR}:${THIS_OCTET}"
+    fi
+    (( NUMBER = NUMBER + 1 ))
+  done
+}
+###############################
+# End of Function: render_mac #
+###############################
+
+#######################################################################
+# Function: select_mask                                               #
+# Parameters: None (uses Global Variables instead)                    #
+# Local Variables: None                                               #
+# Global Variables: THIS_VLAN_MASK, THIS_VLAN_CIDR                    #
+# Purpose: Takes a global variable (THIS_VLAN_CIDR) containing a      #
+#         netmask in "slash" notation (for example, "/24") and        #
+#         populates global variable (THIS_VLAN_MASK) with the         #
+#         netmask in dotted-quad notation (example: "255.255.255.0")  #
+# Returns: Nothing (all data stored in Global variables)              #
+#######################################################################
+# NOTE: Need to rewrite this to use an Array
+select_mask ()
+{
+  case "${THIS_ROUTE_CIDR}" in
+    22) THIS_ROUTE_MASK='255.255.252.0' ;;
+    23) THIS_ROUTE_MASK='255.255.254.0' ;;
+    24) THIS_ROUTE_MASK='255.255.255.0' ;;
+    25) THIS_ROUTE_MASK='255.255.255.128' ;;
+    26) THIS_ROUTE_MASK='255.255.255.192' ;;
+    27) THIS_ROUTE_MASK='255.255.255.224' ;;
+    *)  THIS_ROUTE_MASK="${BOLD_TEXT}UNKNOWN (${ROUTE_MASK})${ALL_OFF}"
+  esac
+}
+################################
+# End of Function: select_mask #
+################################
+
+# If I'm on an AIX version prior to 7.1.3.3, then I cannot determine
+#   Ethernet link state
+# Check OS version - uses function from TOOLS_FILE
+_get_os_release
+AIX_VERSION=$?
+case "${AIX_VERSION}" in
+  255)  # Data parse error
+        print "\n${BOLD_TEXT}${RED_BLACK}FATAL ERROR:${ALL_OFF} ${BOLD_TEXT}Data Parse Failed in _get_os_release${ALL_OFF}\n"
+        AIX_VERSION_DISPLAY='?????????'
+        HELP_FLAG='YES'
+        ;;
+  6)    # AIX v6 does not support determining Link State
+        LINK_STATE_CHECK=0
+        # I will also get the Update, TL and SP values, even though I
+        #   do not need them to figure out if I can determine Link
+        #   State (I already know I can't)
+        # Note that here I *assume* that I can get the info I want
+        #   (since the first function call to gather and parse this
+        #   info didn't fail)
+        # Also, except for Update, the values are all delivered as
+        #   two-digit numbers, but the leading digit is almost
+        #   certainly a zero, so for display purposes I'll render
+        #   the values as single digits
+        _get_os_update
+        AIX_VERSION_UPDATE=$?
+        _get_os_tech_level
+        AIX_VERSION_TL=$?
+        if [[ "${AIX_VERSION_TL:0:1}" == '0' ]]; then
+          AIX_VERSION_TL="${AIX_VERSION_TL:1:1}"
+        fi
+        _get_os_support_pack
+        AIX_VERSION_SP=$?
+        if [[ "${AIX_VERSION_SP:0:1}" == '0' ]]; then
+          AIX_VERSION_SP="${AIX_VERSION_SP:1:1}"
+        fi
+        ;;
+  7)    # AIX v7 supports determining Link State only for 7100-03-03
+        #   or later
+        # Note that here I *assume* that I can get the info I want
+        #   (since the first function call to gather and parse this
+        #   info didn't fail)
+
+        # I may not actually need to know Update, TL and SP to figure
+        #   out if Link State determination is possible, but I'll go
+        #   ahead and read them all, then perform analysis
+        # Also, except for Update, the values are all delivered as
+        #   two-digit numbers, but the leading digit is almost
+        #   certainly a zero, so for comparison purposes I'll render
+        #   the values as single digits
+        _get_os_update
+        AIX_VERSION_UPDATE=$?
+        _get_os_tech_level
+        AIX_VERSION_TL=$?
+        if [[ "${AIX_VERSION_TL:0:1}" == '0' ]]; then
+          AIX_VERSION_TL="${AIX_VERSION_TL:1:1}"
+        fi
+        _get_os_support_pack
+        AIX_VERSION_SP=$?
+        if [[ "${AIX_VERSION_SP:0:1}" == '0' ]]; then
+          AIX_VERSION_SP="${AIX_VERSION_SP:1:1}"
+        fi
+        if [[ "${AIX_VERSION_UPDATE}" -lt 1 ]]; then
+          LINK_STATE_CHECK=0
+        else
+          if [[ "${AIX_VERSION_TL}" -lt 3 ]]; then
+            # Not running at least TL 3
+            LINK_STATE_CHECK=0
+          else
+            # Running TL 3 or better, but if it is not 4+ then
+            #   I need to check SP
+            if [[ "${AIX_VERSION_TL}" -gt 3 ]]; then
+              # OK, host is at TL 4 or higher
+              LINK_STATE_CHECK=1
+            else
+              if [[ "${AIX_VERSION_SP}" -gt 2 ]]; then
+                # OK, host is at TL 3 with SP 3 or higher
+                LINK_STATE_CHECK=1
+              else
+                # Host is at TL 3 with SP 2 or lower
+                LINK_STATE_CHECK=0
+              fi
+            fi
+          fi
+          # End of if [[ "${AIX_VERSION_TL}" -lt 3 ]]
+        fi
+        # End of if [[ "${AIX_VERSION_UPDATE}" -lt 1 ]]
+
+        # IMPORTANT: There is one final check - is "poll_uplink"
+        #             enabled?
+        #	So, even if I have AIX 7.1.3.3 or later, if that
+        #   attribute is not set to "yes" on the interfaces, then I
+        #   still cannot determine Link State
+        # I will check this when processing each interface
+        ;;
+esac
+# End of case "${AIX_VERSION}"
+
+# If I have valid info, then, composit the various values of AIX
+#   versioning into a single variable for display
+if [[ "${AIX_VERSION}" -ne 255 ]]; then
+  AIX_VERSION_DISPLAY="${AIX_VERSION}.${AIX_VERSION_UPDATE}.${AIX_VERSION_TL}.${AIX_VERSION_SP}"
+fi
+
+# Help Screen
+HELP="
+${0} - ${BOLD_TEXT}AIX Network Interface Reporting Tool v${TOOL_VERSION}${ALL_OFF}
+
+\t${BOLD_TEXT}Usage :${ALL_OFF} ${0} [ -n | -h ]${ALL_OFF}
+\t${BOLD_TEXT}Syntax:${ALL_OFF}
+
+\t\t${BOLD_TEXT}-h${ALL_OFF} --> Show this help screen and exit
+
+\t\t${BOLD_TEXT}-n${ALL_OFF} --> Do not perform PING test on Default Gateway
+
+\tArguments are optional
+\t${BOLD_TEXT}Found ${GREEN_BLACK}${TOOLS_FILE}${ALL_OFF} ${BOLD_TEXT}v${AIX_TOOLS_LIBRARY_VERSION}${ALL_OFF}
+\tEffective UID is ${EUID}
+\t${BOLD_TEXT}Detected AIX v${GREEN_BLACK}${AIX_VERSION_DISPLAY}${ALL_OFF}
+"
+
+# If -h argument given, or an unknown/invalid argument was given,
+#   display help screen and exit
+if [[ "${HELP_FLAG}" == 'YES' || "${UNKNOWN}" == 'YES' ]]; then
+  print "${HELP}"
+  exit 0
+fi
+
+###########################
+## Real Work Starts Here ##
+###########################
+# At this point I have determined AIX version; if it was AIX v7, then I
+#   also know the Update; if it was AIX v7.1, when I also know the TL;
+#   if it was AIX v7.1.3, when I also know the SP
+# The value of LINK_STATE_CHECK indicates if I have the ability to
+#   determine if an Ethernet interface has link (0=No,1=Yes)
+# However, the ability to determine Link State may be present but
+#   DISABLED if the "poll_uplink" attribute of the NIC is set to "no"
+THIS_HOSTNAME=$( ${UNAME_TOOL} -n )
+DEFAULT_DOMAIN=$( ${SYS_CONF_TOOL} | ${GREP_TOOL} 'Domain Name' | ${AWK_TOOL} '{ print $3 }' )
+print "\n${0} v${TOOL_VERSION} - AIX Network Interface Reporting Tool"
+print "\n\tChecking for Ethernet NICs in AIX ${BOLD_TEXT}v${AIX_VERSION_DISPLAY}${ALL_OFF} host ${BOLD_TEXT}${THIS_HOSTNAME}.${DEFAULT_DOMAIN}${ALL_OFF}\n"
+
+# Now I generate a list of NICs (devices with names starting "ent")
+#	These will be virtual NICs presented to the LPAR
+NIC_LIST=$( ${LS_DEV_TOOL} | ${GREP_TOOL} ^ent | ${AWK_TOOL} '{ print $1 }' | ${TR_TOOL} "\n" " " )
+
+# Table header
+print "${BOLD_TEXT}\t\t         MAC\t\tInterface\t  Link"
+print "\t${BOLD_TEXT}NIC_\t   ____Address______\t__State__\tDetected?\t___Location_________${ALL_OFF}"
+
+# For each "ent" interface, I can gather:
+#	MAC Address: lscfg -v -l INTERFACE | grep 'Network Address' | tr "." " " | awk '{ print $3 }'
+#	Interface State: entstat -d INTERFACE | grep 'LAN State:' | awk '{ print $3 }'
+#           "Operational" would seem to indicate the same thing as
+#           "Administratively Up" in Linux
+#	Link Detected: entstat -d INTERFACE | grep 'PHY'
+#           If that is "PHYS_LINK_UP" then I have link
+#	Location: lscfg -v -l INTERFACE | grep INTERFACE | awk '${ print $2 }'
+# Note #1: I  **assume**  that all AIX hosts are LPARs, so the
+#           "Description" text will *always* be
+#           "Virtual I/O Ethernet Adapter (l-lan)"
+# Note #2: I can only get "Interface State" when on AIX 7.1.3.3 (or later)
+#           **AND**  "poll_uplink" has been enabled on the host
+for NIC in $( print "${NIC_LIST}" ); do
+  MAC_ADDR_RAW=$( ${LS_CFG_TOOL} -v -l ${NIC} | ${GREP_TOOL} 'Network Address' | ${TR_TOOL} "." " " | ${AWK_TOOL} '{ print $3 }' )
+  # The result will be the MAC address but it will lack : characters
+  #   separating the octets; call internal function to fix that
+  #   (results will be stored in variable MAC_ADDR)
+  render_mac
+
+  CHKSTR=$( ${ENT_TOOL} -d ${NIC} )
+  RETCODE=$?
+  if [[ "${RETCODE}" -eq 0 ]]; then
+    CHKSTR=$( ${ENT_TOOL} -d ${NIC} | ${GREP_TOOL} 'LAN State:' | ${AWK_TOOL} '{ print $3 }' )
+    if [[ "${CHKSTR}" == 'Operational' ]]; then
+      INTERFACE_STATE='UP'
+    else
+      INTERFACE_STATE='DOWN'
+    fi
+  else
+    # This is a device which I will not be able to probe
+    #	It could be a Shared Ethernet Adapter (SEA), or a Link
+    #   Aggregation, or a Physical adapter represented in an
+    #   LPAR; no matter which, I cannot actually process this
+    #   adapter, so I skip it
+    continue
+  fi
+  if [[ "${LINK_STATE_CHECK}" -eq 1 ]]; then
+    # I have the proper OS support, let me see if the
+    #   functionality is actually turned on
+    # Use -w on the grep so I match the word and not a
+    #   similar attribute
+    CHKSTR=$( ${LS_ATTR_TOOL} -El ${NIC} | ${GREP_TOOL} -w poll_uplink | ${AWK_TOOL} '{ print $2 }' )
+    if [[ "${CHKSTR}" != 'YES' ]]; then
+      # I have OS support, but the functionality is not turned on
+      LINK_STATE='Not Avail'
+    else
+      LINK_STATE=$( ${ENT_TOOL} -d ${NIC} | ${GREP_TOOL} -c PHYS_LINK_UP )
+      if [[ "${LINK_STATE}" -ne 0 ]]; then
+        LINK_STATE='YES'
+      else
+        LINK_STATE='NO'
+      fi
+    fi
+  else
+    # I do not have OS support
+    LINK_STATE='Unknown'
+  fi
+  # End of if [[ "${LINK_STATE_CHECK}" -eq 1 ]]
+  NIC_LOCATION=$( ${LS_CFG_TOOL} -v -l ${NIC} | ${GREP_TOOL} ${NIC} | ${AWK_TOOL} '{ print $2 }' )
+  # I do not need first 17 characters
+  NIC_LOCATION="${NIC_LOCATION:18}"
+  print "\t${NIC}\t${MAC_ADDR}\t${INTERFACE_STATE}\t     ${LINK_STATE}\t     ${NIC_LOCATION}"
+done
+# End of for NIC in "${NIC_LIST}"
+
+# Table header
+print "\n${BOLD_TEXT}\tInterface  __IP Address___  ____Netmask____\t___Hostname_(from_${BOLD_TEXT}${GREEN_BLACK}${HOST_FILE}${ALL_OFF}${BOLD_TEXT})___${ALL_OFF}"
+
+# Now I generate a list of logical interfaces (device names starting
+#   with "en" - but NOT "ent")
+INT_LIST=$( ${LS_DEV_TOOL} | ${GREP_TOOL} ^en | ${GREP_TOOL} -v ^ent | ${AWK_TOOL} '{ print $1 }' | ${TR_TOOL} "\n" " " )
+
+# For each "en#" interface, I can gather:
+#	IP Address: ifconfig INTERFACE | grep inet | awk '{ print $2 }'
+#	Netmask: lsattr -El INTERFACE | grep netmask | awk '{ print $2 }'
+#	Host name (from /etc/hosts): grep IPADDR /etc/hosts | awk '${ print $2 }'
+# Note #1: I  **assume**  that if an "en#" interface exists, it has an IP
+# Note #2: I use "lsattr" to get the netmask (instead of "ifconfig")
+#           because "ifconfig" reports it in hex and not dotted-quad
+for INTERFACE in $( print "${INT_LIST}" ); do
+  CHKSTR=$( ${CFG_TOOL} ${INTERFACE} )
+  RETCODE=$?
+  if [[ "${RETCODE}" -eq 0 ]]; then
+    IP_ADDR=$( ${CFG_TOOL} ${INTERFACE} | ${GREP_TOOL} inet | ${AWK_TOOL} '{ print $2 }' )
+  else
+    # This is a device I will not be able to probe
+    # It could be a Shared Ethernet Adapter (SEA), or a Link
+    #   Aggregation, or a Physical adapter represented in an
+    #   LPAR; no matter which, I cannot actually process this
+    #   adapter, so I skip it
+    continue
+  fi
+  NETMASK=$( ${LS_ATTR_TOOL} -El ${INTERFACE} | ${GREP_TOOL} netmask | ${AWK_TOOL} '{ print $2 }' )
+  # Does the IP address seem to be in the file
+  CHKSTR=$( ${GREP_TOOL} -c ^${IP_ADDR} ${HOST_FILE} )
+  if [[ "${CHKSTR}" -gt 0 ]]; then
+    # Yes - I assume entry with an anchored full-word match is
+    #   the correct one
+    HOST_NAME=$( ${GREP_TOOL} -w ^${IP_ADDR} ${HOST_FILE} | ${AWK_TOOL} '{ print $2 }' )
+    COLOR_TEXT=''
+  else
+    # No - unable to find a matching entry
+    HOST_NAME="No entry in ${HOST_FILE}"
+    COLOR_TEXT="${BOLD_TEXT}${RED_BLACK}"
+  fi
+  # NOTE: In general, it is  *probably*  true that the (networking
+  #   layer) interface known as "enX" is associated to the (physical
+  #   layer) NIC called "entX" (where "X" is the same non-negative
+  #   integer value) - however, that is not a requirement, and it's
+  #   entirely possible for "ent57" to be the "physical" device
+  #   behind the "en0" interface
+  # The only way to definitely associate it is using the MAC address,
+  #   which should be the same for the linked "entX" and "enX" devices
+  # Note that for the purposes of this comparison, I don't care about
+  #   case (and so I do not use the "render_mac" function); "netstat"
+  #   should return directly-comparable values for both devices
+  INT_NIC=''
+  SPACER='        '
+  INT_MAC=$( ${NETSTAT_TOOL} -v ${INTERFACE} | ${GREP_TOOL} 'Hardware Address:' | ${AWK_TOOL} '{ print $3 }' )
+  for NIC in $( print "${NIC_LIST}" ); do
+    NIC_MAC=$( ${NETSTAT_TOOL} -v ${NIC} | ${GREP_TOOL} 'Hardware Address:' | ${AWK_TOOL} '{ print $3 }' )
+    if [[ "${NIC_MAC}" == "${INT_MAC}" ]]; then
+      INT_NIC=" (${NIC})"
+      SPACER='     '
+      break
+    fi
+  done
+
+  print "${SPACER}${COLOR_TEXT}${INTERFACE}${INT_NIC}\t${IP_ADDR}\t ${NETMASK}\t     ${HOST_NAME}${ALL_OFF}"
+  # OLD - before enX<-->entX linking print "${COLOR_TEXT}\t${INTERFACE}\t${IP_ADDR}\t ${NETMASK}\t     ${HOST_NAME}${ALL_OFF}"
+done
+# End of for INTERFACE in $( print "${INT_LIST}" )
+print
+
+#######################################################################
+# NOTE: Since ALL of the AIX hosts are LPARs, they do not report NIC  #
+#       speed or Duplex for their virtualized Ethernet interfaces,    #
+#       so I do not investigate that                                  #
+#######################################################################
+# Route table
+# In AIX, there is no equivalent to "/etc/sysconfig/network" or
+#   definition of the "Default Gateway" in an "ifcfg-*" file
+# Also, the "route" command is  *exclusively*  used to manipulate the
+#   routing table - it does not report anything
+# The only way to investigate the current routing configuration is
+#   using "netstat"
+LPAR_DEFAULT_ROUTE_DATA=$( ${NETSTAT_TOOL} -r | ${GREP_TOOL} default )
+LPAR_DEFAULT_ROUTE_IP=''
+LPAR_DEFAULT_ROUTE_IP=$( echo "${LPAR_DEFAULT_ROUTE_DATA}" | ${AWK_TOOL} '{ print $2 }' )
+LPAR_DEFAULT_ROUTE_FLAGS=$( echo "${LPAR_DEFAULT_ROUTE_DATA}" | ${AWK_TOOL} '{ print $3 }' )
+LPAR_DEFAULT_ROUTE_INT=$( echo "${LPAR_DEFAULT_ROUTE_DATA}" | ${AWK_TOOL} '{ print $6 }' )
+
+# Print the table header
+print "\t${BOLD_TEXT}${GREEN_BLACK}Route Table Analysis:${ALL_OFF}"
+print "\n${BOLD_TEXT}\t____Network____\t_____Mask______\tInterface\t____Notes_______________${ALL_OFF}"
+
+# I have gotten the IP (LPAR_DEFAULT_ROUTE_IP) and interface
+#   (LPAR_DEFAULT_ROUTE_INT) associated to the "default" route easily
+#   enough, but to determine the mask for the network I need to look
+#   for a line that has the interface (but not the word "default")
+#   and a forward-slash (/) character
+# The first field of the line will look like "10.62.XXX/YY" where "XXX"
+#   should match the VLAN and "YY" will be the mask in Cisco-esque
+#   slash notation ("/24" = "255.255.255.0")
+# I use multiple "awk" statements to extract the "YY" value
+# Note that the string I use for the first grep has spaces on both
+#   sides - this is to prevent (for example) "en1" and "en11" mis-matches
+#######################################################################
+## IMPORTANT!!!!
+## There can be  *multiple*  lines for a given "en?" interface!!!
+## For example, "netstat -r | grep " en0 " | grep -v default"
+##  which might output:
+##    10.2.21.0    somehostname    UHSb  0      0      en0   -  -   =>
+##    10.2.21/24   somehostname    U     5   78297261  en0   -  -
+##    10.2.21.255  somehostname    UHSb  0      4      en0   -  -
+##    10.2.24/24   10.2.20.1       UGS   0      0      en0   -  -
+##
+## In order to detect this I need to see if there are any lines where
+##    a route is attached to the same interface as the "default" route
+##    but the 2nd column is NOT the host name
+#######################################################################
+THIS_ROUTE_CIDR=$( ${NETSTAT_TOOL} -r | ${GREP_TOOL} " ${LPAR_DEFAULT_ROUTE_INT} " | ${GREP_TOOL} -v default | ${GREP_TOOL} '/' | ${GREP_TOOL} ${THIS_HOSTNAME} | ${AWK_TOOL} '{ print $1 }' | ${AWK_TOOL} -F '/' '{ print $2 }' )
+select_mask
+print "${BOLD_TEXT}  \tdefault${ALL_OFF}\t   ${THIS_ROUTE_MASK}     ${LPAR_DEFAULT_ROUTE_INT}\t   Flags=${LPAR_DEFAULT_ROUTE_FLAGS}"
+
+# Now, are there other routes on this interface?
+OTHER_ROUTES_ON_INTERFACE=$( ${NETSTAT_TOOL} -r | ${GREP_TOOL} " ${LPAR_DEFAULT_ROUTE_INT} " | ${GREP_TOOL} -v default | ${GREP_TOOL} -v ${THIS_HOSTNAME} )
+# If there are any additional routes assigned to this interface, then
+#   the string will not be blank
+if [[ "${OTHER_ROUTES_ON_INTERFACE}" != '' ]]; then
+  # There is at least one more route assigned to this interface
+  OTHER_ROUTE_LIST=$( echo ${OTHER_ROUTES_ON_INTERFACE} | ${AWK_TOOL} '{ print $1 }' | ${TR_TOOL} "\n" " " )
+  OTHER_ROUTE_COUNT=$( echo ${OTHER_ROUTE_LIST} | ${AWK_TOOL} '{ print NF }' )
+else
+  OTHER_ROUTE_COUNT=0
+fi
+
+# Are there other routes on the same interface as the default?
+if [[ "${OTHER_ROUTE_COUNT}" -ne 0 ]]; then
+  for ((ITERATOR=1;ITERATOR<=${OTHER_ROUTE_COUNT};ITERATOR++)); do
+    THIS_ROUTE_DATA=$( echo ${OTHER_ROUTE_LIST} | ${AWK_TOOL} -v num=${ITERATOR} '{ print $num }' )
+    THIS_ROUTE_CIDR=$( echo ${THIS_ROUTE_DATA} | ${AWK_TOOL} -F '/' '{ print $2 }' )
+    select_mask
+    THIS_ROUTE_NETWORK=$( echo ${THIS_ROUTE_DATA} | ${AWK_TOOL} -F '/' '{ print $1 }' )
+    THIS_ROUTE_NETWORK="${THIS_ROUTE_NETWORK}.0"
+    THIS_ROUTE_FLAGS=$( ${NETSTAT_TOOL} -r | ${GREP_TOOL} "${THIS_ROUTE_DATA}" | ${AWK_TOOL} '{ print $3 }' )
+    THIS_ROUTE_GATEWAY=$( ${NETSTAT_TOOL} -r | ${GREP_TOOL} "${THIS_ROUTE_DATA}" | ${AWK_TOOL} '{ print $2 }' )
+    print "${BOLD_TEXT}  \t${THIS_ROUTE_NETWORK}${ALL_OFF}\t   ${THIS_ROUTE_MASK}     ${LPAR_DEFAULT_ROUTE_INT}\t   Flags=${THIS_ROUTE_FLAGS}"
+  done
+fi
+
+# Let me see if there are other routes defined; I can do this by listing
+#   the route table again and excluding the interface used by the default
+#   route (and also the "loopback" interface) and again looking for a
+#   first field that looks like the value of LPAR_DEFAULT_ROUTE_INT
+LPAR_ROUTE_INTERFACE_LIST=''
+LPAR_ROUTE_INTERFACE_LIST=$( ${NETSTAT_TOOL} -r | ${GREP_TOOL} -v " ${LPAR_DEFAULT_ROUTE_INT} " | ${GREP_TOOL} -v " lo0 " | ${GREP_TOOL} '/' | ${AWK_TOOL} '{ print $6 }' | ${TR_TOOL} "\n" " " )
+if [[ "${LPAR_ROUTE_INTERFACE_LIST}" != '' ]]; then
+  INT_COUNT=$( echo ${LPAR_ROUTE_INTERFACE_LIST} | ${AWK_TOOL} '{ print NF }' )
+  for ((ITERATOR=1;ITERATOR<=${INT_COUNT};ITERATOR++)); do
+    THIS_INT=$( echo ${LPAR_ROUTE_INTERFACE_LIST} | ${AWK_TOOL} -v num=${ITERATOR} '{ print $num }' )
+    THIS_ROUTE_DATA=$( ${NETSTAT_TOOL} -r | ${GREP_TOOL} " ${THIS_INT} " | ${GREP_TOOL} '/' | ${AWK_TOOL} '{ print $1 }' )
+    THIS_ROUTE_CIDR=$( echo ${THIS_ROUTE_DATA} | ${AWK_TOOL} -F '/' '{ print $2 }' )
+    select_mask
+
+    # NOTE: Simply extracting the first 9 characters of the string
+    #       and appending ".0" basically assumes a Class C network
+    THIS_NETWORK="${THIS_ROUTE_DATA:0:9}.0"
+    THIS_FLAGS=$( ${NETSTAT_TOOL} -r | ${GREP_TOOL} " ${THIS_INT} " | ${GREP_TOOL} '/' | ${AWK_TOOL} '{ print $3 }' )
+    print "${BOLD_TEXT}  \t${THIS_NETWORK}${ALL_OFF}\t   ${THIS_ROUTE_MASK}     ${THIS_INT}\t   Flags=${THIS_FLAGS}"
+  done
+fi
+
+if [[ "${LPAR_DEFAULT_ROUTE_IP}" != '' ]]; then
+  print "\n\tThe Default Gateway for this host is ${BOLD_TEXT}${LPAR_DEFAULT_ROUTE_IP}${ALL_OFF}\c"
+  if [ "${NOPING}" == 'YES' ]; then
+    # User requested I skip PING test
+    print "${BOLD_TEXT}  ...skipping PING test (user request)${ALL_OFF}"
+  else
+    # Run the PING test
+    print "${GREEN_BLACK}  ...standby for PING test${ALL_OFF}\n"
+    CHKSTR=$( ${PING_TOOL} -c ${NUM_PINGS} ${LPAR_DEFAULT_ROUTE_IP} | ${GREP_TOOL} -p loss )
+    LOSS_DATA=$( echo "${CHKSTR}" | ${GREP_TOOL} loss  )
+    LOSS=$( echo "${LOSS_DATA}" | ${AWK_TOOL} '{ print $7 }' )
+    case "${LOSS}" in
+      '0%')   AVERAGE_RTT_DATA=$( echo "${CHKSTR}" | ${GREP_TOOL} 'round-trip' )
+              AVERAGE_RTT=$( echo "${AVERAGE_RTT_DATA}" | ${AWK_TOOL} '{ print $4 }' | ${AWK_TOOL} -F '/' '{ print $2 }' )
+              if [[ "${AVERAGE_RTT}" -eq 0 ]]; then
+                AVERAGE_RTT='<1'
+              fi
+              AVERAGE_RTT_UNITS=$( echo "${AVERAGE_RTT_DATA}" | ${AWK_TOOL} '{ print $5 }' )
+              print "\t\t${BOLD_TEXT}The Default Gateway is reachable via PING (${NUM_PINGS} PINGs, ${LOSS} packet loss, avg rtt ${AVERAGE_RTT}${AVERAGE_RTT_UNITS})${ALL_OFF}"
+              ;;
+      '100%') print "${BOLD_TEXT}${MAGENTA_BLACK}\t\tThe Default Gateway is unreachable via PING (100% packet loss)${ALL_OFF}"
+              ;;
+      *)      print "${BOLD_TEXT}\t\tThe Default Gateway is not ${MAGENTA_BLACK}RELIABLY${ALL_OFF} ${BOLD_TEXT}reachable via PING (${LOSS} packet loss)${ALL_OFF}"
+              ;;
+    esac
+  fi
+else
+  print "\n\t${BOLD_TEXT}${MAGENTA_BLACK}WARNING:${ALL_OFF} ${BOLD_TEXT}Unable to determine Default Gateway for this host${ALL_OFF}"
+fi
+print
+
+# End of aixnetreport
+#####################

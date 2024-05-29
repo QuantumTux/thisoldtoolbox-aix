@@ -1,0 +1,450 @@
+#!/usr/bin/ksh93
+#######################################################################
+# aixdiskreport - AIX Disk and Logical Volume Reporting Tool
+#######################################################################
+# This tool is designed to gather and distill the storage
+#   configuration on an AIX LPAR. It only looks at storage devices
+#   that are reported by the "lspv" command.
+#
+# REQUIRES:
+#   0) aix_tools.ksh v1.00 or later
+#   1) Privileged Access
+#
+# NOTES:
+#   0) Because AIX does not have native "grep" that supports context
+#       parameters (such as "-A" and "-B" in GNU "grep"), "nawk" is
+#       used as needed to approximate the same feature
+#   1) The AIX version of "grep" also does not support the "-m"
+#       parameter, so "sed <number>p" is used to emulate that function
+#       as needed
+#   2) The AIX version of "wc" has no way to limit the output to just
+#       the number of lines in the file, so "awk" must also be used to
+#       trim the output
+#   3) This tool *always* correlates LVs *and* shows mountpoints (when
+#       invoked with "-f" or "-v"); since the AIX environment uses
+#       JFS/JFS2 exclusively, filesystem type is not displayed
+#
+# KNOWN BUGS:
+#   0) Temporary files created will not be cleaned up if the tool is
+#       killed before completion
+#   1) Does not verify all dependencies
+#
+# TO DO:
+#   0) Display % free filesystem space next to mount points
+#   1) Validate version of TOOLS_FILE
+#   2) Make temporary file dynamically instead of static
+#
+TOOL_VERSION='1.00'
+#######################################################################
+# Change Log (Reverse Chronological Order)
+# Who When______ What__________________________________________________
+# dxb 2018-08-21 Initial creation (v1.00)
+#######################################################################
+# Requires aix_tools.ksh
+TOOLS_FILE='/usr/local/lib/aix_tools.ksh'
+# Make sure it exists, is NOT 0-length, and is a regular file
+if [[ -e ${TOOLS_FILE} && -s ${TOOLS_FILE} && -f ${TOOLS_FILE} ]]; then
+  . ${TOOLS_FILE}
+else
+  print "\nFATAL ERROR: Unable to source a valid tool library (${TOOLS_FILE})\n"
+  exit 1
+fi
+# TO DO: Check the version of TOOLS_FILE
+
+# Initialize command-shortcut variables
+_init_script_tool_names
+# Emulate BASH built-in variables
+_init_script_variables
+# Set up variables to colorize text output
+_init_script_colors
+
+# Default exit code
+EXIT_CODE=0
+
+# Definition for OUTPUT_MODE
+#       0 - Verbose (all output to stdout)
+#       1 - Quiet (limited output)
+OUTPUT_MODE=0
+
+# Temporary files
+# TODO: Use mktemp
+TMP_FILE_A='/tmp/.LVMinfo'
+TMP_FILE_B='/tmp/.LVMdata'
+
+DEBUG='NO'
+FULL='NO'
+GROUPS='NO'
+HELP_FLAG='NO'
+NO_ORPHANS='NO'
+QUIET='NO'
+UNKNOWN='NO'
+VOLUMES='NO'
+# Command Line Argument Processing
+while getopts ':dfgnqvh' OPT; do
+  case ${OPT} in
+    d)  DEBUG='YES'
+        # Also force output to screen
+        OUTPUT_MODE=0
+        ;;
+    f)  FULL='YES'
+        GROUPS='YES'
+        VOLUMES='YES'
+        ;;
+    g)  GROUPS='YES';;
+    h)  HELP_FLAG='YES';;
+    n)  NO_ORPHANS='YES';;
+    q)  QUIET='YES'
+        OUTPUT_MODE=1
+        ;;
+    v)  VOLUMES='YES' ;;
+    *)  UNKNOWN='YES' ;;
+  esac
+done
+
+# Help Screen
+HELP="
+${0} - ${BOLD_TEXT}AIX Disk and Logical Volume Reporting Tool v${TOOL_VERSION}${ALL_OFF}
+
+\t${BOLD_TEXT}Usage :${ALL_OFF} ${0} [ [ -f | [ -g ][ -v ] ] [ -d ] [ -n ] | -q | -h ]${ALL_OFF}
+\t${BOLD_TEXT}Syntax:${ALL_OFF}
+
+\t\t${BOLD_TEXT}-d${ALL_OFF} --> Debug mode; write debugging messages to ${BOLD_TEXT}stdout${ALL_OFF}
+\t\t\t(This flag cancels out the ${BOLD_TEXT}-q${ALL_OFF} flag)
+
+\t\t${BOLD_TEXT}-f${ALL_OFF} --> Full report - Same as ${BOLD_TEXT}-g${ALL_OFF} and ${BOLD_TEXT}-v${ALL_OFF}
+\t\t\t(The ${BOLD_TEXT}-n${ALL_OFF} flag will be ignored)
+
+\t\t${BOLD_TEXT}-g${ALL_OFF} --> Analyze Volume Groups (Shows details for all Volume Groups)
+
+\t\t${BOLD_TEXT}-h${ALL_OFF} --> Show this help screen and exit
+
+\t\t${BOLD_TEXT}-n${ALL_OFF} --> Do not process orphan Physical Devices
+\t\t\t(That is, ignore any Physical Device not part of a Volume Group)
+
+\t\t${BOLD_TEXT}-q${ALL_OFF} --> Quiet mode - Outputs a single line showing GB of local storage
+\t\t\t\"local\" storage is Physical Volumes reported by the ${BOLD_TEXT}${PVS_TOOL}${ALL_OFF} command
+\t\t\tThe output will be ${BOLD_TEXT}0${ALL_OFF} if there are any problems
+\t\t\t(Unless cancelled by the ${BOLD_TEXT}-d${ALL_OFF} flag, this flag will cause all flags other than ${BOLD_TEXT}-h${ALL_OFF} to be ignored)
+
+\t\t${BOLD_TEXT}-v${ALL_OFF} --> Analyze Logical Volumes (Shows details for all Logical Volumes)
+
+\tArguments are optional
+\t${BOLD_TEXT}Found ${GREEN_BLACK}${TOOLS_FILE}${ALL_OFF} ${BOLD_TEXT}v${AIX_TOOLS_LIBRARY_VERSION}${ALL_OFF}
+\tPrivilege is required to run this script
+"
+
+# Check to see if user is privileged
+# EUID variable was populated by _init_script_variables
+if [[ "${EUID}" -ne 0 ]]; then
+  print "\nFATAL ERROR: Privilege is required to run this tool\n"
+  HELP_FLAG='YES'
+  EXIT_CODE=1
+else
+  # If not in Quiet Mode and were not invoked with "-h", print banner
+  if [[ "${OUTPUT_MODE}" -eq 0 && "${HELP_FLAG}" == 'NO' ]]; then
+    print "${0} - AIX Disk and Logical Volume Reporting Tool v${SCRIPT_VERSION}"
+    print "\t\t${BOLD_TEXT}${GREEN_BLACK}Privileged status verified!${ALL_OFF}\n"
+  fi
+fi
+
+# If invoked with "-d", then make sure "-q" is cancelled out
+if [[ "${DEBUG}" == 'YES' && "${QUIET}" == 'YES' ]]; then
+  QUIET='NO'
+  OUTPUT_MODE=0
+fi
+
+# If invoked with "-f", then "-n" is cancelled
+if [[ "${NO_ORPHANS}" == 'YES' && "${FULL}" == 'YES' ]]; then
+  NO_ORPHANS='NO'
+fi
+
+# "-q" cancels out "-n", but only if "-q" was not itself cancelled by "-d"
+if [[ "${NO_ORPHANS}" == 'YES' && "${QUIET}" == 'YES' ]]; then
+  NO_ORPHANS='NO'
+fi
+
+# If invoked with "-q" and it was not cancelled out, then it cancels
+#	  out "-f", "-g" and "-v"
+if [[ "${QUIET}" == 'YES' ]]; then
+  FULL='NO'
+  GROUPS='NO'
+  VOLUMES='NO'
+fi
+
+# If -h argument given, or an unknown/invalid argument was given, display
+#   help screen and exit
+if [[ "${HELP_FLAG}" == 'YES' || "${UNKNOWN}" == 'YES' ]]; then
+  print "${HELP}"
+  exit ${EXIT_CODE}
+fi
+
+# Get the short host name
+THIS_HOSTNAME=$( ${UNAME_TOOL} -n )
+
+###########################
+## Real Work Starts Here ##
+###########################
+if [[ "${OUTPUT_MODE}" -eq 0 ]]; then
+  print "\tChecking Local Storage Configuration in AIX host ${THIS_HOSTNAME}"
+fi
+
+# Start by gathering a list of Physical Volumes
+#	By sorting, I guarantee "hdisk0" is the first disk listed, and since
+#   "hdisk0" is universally associated to "rootvg", I ensure that
+#   my list of Volume Groups (VG_LIST) will start with "rootvg"!
+PV_DEVICE_LIST=$( ${PVS_TOOL} | ${SORT_TOOL} -k 1,1 | ${AWK_TOOL} '{ print $1 }' | ${TR_TOOL} "\n" " " )
+PV_DEVICE_CNT=$( echo ${PV_DEVICE_LIST} | ${AWK_TOOL} '{ print NF }' )
+if [[ "${PV_DEVICE_CNT}" -eq 1 ]]; then
+  NOUN='device'
+else
+  NOUN='devices'
+fi
+
+# Count of Orphan PVss (ones that do not belong to a VG)
+PV_ORPHAN_CNT=0
+
+if [[ "${OUTPUT_MODE}" -eq 0 ]]; then
+  print "\n\tDetected ${PV_DEVICE_CNT} managed storage ${NOUN}:\n"
+  print "\t\tDevice_Name\tSize_(GB)\tVolume_Group"
+else
+  TOTAL_STORAGE=0
+fi
+
+# Cycle thru the list - determine devices that are members of a
+#   Volume Group
+for (( ITERATOR=1 ; ITERATOR <= ${PV_DEVICE_CNT} ; ITERATOR++ )); do
+  PV_DEVICE=$( echo ${PV_DEVICE_LIST} | ${AWK_TOOL} -v num=${ITERATOR} '{ print $num }' )
+  # Is this device part of a VG?
+  # NOTE: I cannot just "lspv hdiskX" because I'll get
+  #       impossible-to-parse garbage if the disk is not part of a VG!
+  # IMPORTANT: Use the "-w" parameter with "grep" to avoid "hdisk1"
+  #             and "hdisk11" matching inappropriately
+  CHKSTR=$( ${PVS_TOOL} | ${GREP_TOOL} -w ${PV_DEVICE} | ${AWK_TOOL} '{ print $3 }' )
+  if [[ "${CHKSTR}" != 'None' ]]; then
+    # This PV is part of a VG
+    VG_NAME="${CHKSTR}"
+  else
+    (( PV_ORPHAN_CNT = PV_ORPHAN_CNT + 1 ))
+    # If invoked with "-n", then do NOT display this PV
+    if [[ "${NO_ORPHANS}" == 'YES' ]]; then
+      continue
+    fi
+    VG_NAME="${BOLD_TEXT}${MAGENTA_BLACK}NONE${ALL_OFF}"
+  fi
+  # Get the size of the disk, in MB
+  PV_DEVICE_SIZE_MB=$( ${AIX_CONF_TOOL} DISK_SIZE /dev/${PV_DEVICE} )
+  # Need to render as GB; at the PV level, I don't care about fractions
+  (( PV_DEVICE_SIZE = PV_DEVICE_SIZE_MB / 1024 ))
+  if [[ "${OUTPUT_MODE}" -eq 0 ]]; then
+    print "\t\t${PV_DEVICE}\t\t${PV_DEVICE_SIZE}\t\t${VG_NAME}"
+  else
+    (( TOTAL_STORAGE = TOTAL_STORAGE + PV_DEVICE_SIZE ))
+  fi
+done
+# End of for (( ITERATOR=1 ; ITERATOR <= ${PV_DEVICE_CNT} ; ITERATOR++ ))
+
+# If invoked with "-q", then print out total storage found and exit
+if [[ "${OUTPUT_MODE}" -eq 1 ]]; then
+  echo "${TOTAL_STORAGE}"
+  # If invoked with "-q", then I use a non-zero exit code
+  #   to indicate SUCCESS
+  exit 1
+fi
+
+# NOTE: Past this point, the tool was NOT invoked with "-q", so
+#       OUTPUT_MODE will always be 0 (but I left in the "if"
+#       statements to support future functionality that has
+#       other values for OUTPUT_MODE)
+
+# IMPORTANT: I did NOT construct the list of Volume Groups
+#           using the loop above, because it is possible for a VG to
+#           be associated with multiple PVs
+# I get the list of defined VGs now, and I make sure that universal
+#	  "rootvg" is the first one in the list
+VG_LIST=$( ${VGS_TOOL} | ${GREP_TOOL} -v rootvg | ${TR_TOOL} "\n" " " )
+VG_LIST="rootvg ${VG_LIST}"
+
+# At this point, VG_LIST is populated with a list of all the defined
+#	  Volume Groups, and my sort of PVs above means that "rootvg"
+#	  should always be the first VG in the list
+
+#########################
+# Volume Group Analysis #
+#########################
+if [[ "${GROUPS}" == 'YES' ]]; then
+  VG_NAME_CNT=$( echo ${VG_LIST} | ${AWK_TOOL} '{ print NF }' )
+  if [[ "${VG_NAME_CNT}" -eq 1 ]]; then
+    VERB='is'
+    NOUN='Group'
+  else
+    VERB='are'
+    NOUN='Groups'
+  fi
+  if [[ "${OUTPUT_MODE}" -eq 0 ]]; then
+    print "\n\tThere ${VERB} ${VG_NAME_CNT} Volume ${NOUN} defined:\n"
+    print "\t\tVolume\t\tStorage (in GB)\t\tLVs in"
+    print "\t\tGroup_Name\tTotal_\t__Free_\t\tThis_VG"
+  fi
+  for VOL_GROUP in $( echo ${VG_LIST} ); do
+    VG_SIZE_MB=$( ${VGS_TOOL} ${VOL_GROUP} | ${GREP_TOOL} 'TOTAL PPs:' | ${AWK_TOOL} '{ print $7 }' | ${AWK_TOOL} -F '(' '{ print $2 }' )
+    VG_FREE_MB=$( ${VGS_TOOL} ${VOL_GROUP} | ${GREP_TOOL} 'FREE PPs:' | ${AWK_TOOL} '{ print $7 }' | ${AWK_TOOL} -F '(' '{ print $2 }' )
+    # Render those as GB - use "bc" to preserve fractional info
+    # NOTE: In ksh93 I can handle floats natively, but not with
+    #       ksh88 or bash
+    # However, if < 1024 MB, then use "<1"
+    if [[ "${VG_SIZE_MB}" -lt 1024 ]]; then
+      VG_SIZE='<1'
+    else
+      CALC="scale=1;(${VG_SIZE_MB} / 1024)"
+      VG_SIZE=$( echo "${CALC}" | ${CALC_TOOL} -l )
+    fi
+
+    if [[ "${VG_FREE_MB}" -lt 1024 ]]; then
+      if [[ "${VG_FREE_MB}" -gt 0 ]]; then
+        VG_FREE='<1'
+      else
+        VG_FREE='0'
+      fi
+    else
+      CALC="scale=1;(${VG_FREE_MB} / 1024)"
+      VG_FREE=$( echo "${CALC}" | ${CALC_TOOL} -l )
+    fi
+    # Get the count of LVs in this VG - note that I'm concerned
+    #   with LVs that have a "TYPE" of JFS2  *and*  those where
+    #   the "TYPE" is "paging", so I need to construct the
+    #   "grep" statement to account for both, and to use "-w"
+    #   so I don't also get LVs that have a "TYPE" of "jfs2log"
+    VG_LV_CNT=$( ${VGS_TOOL} -l ${VOL_GROUP} | ${GREP_TOOL} -w -E 'jfs2|paging' | ${WC_TOOL} -l | ${AWK_TOOL} '{ print $1 }' )
+    printf "\t\t%10s\t%5s\t%6s\t\t%4s\n" ${VOL_GROUP} ${VG_SIZE} ${VG_FREE} ${VG_LV_CNT}
+  done
+  # End of for VOL_GROUP in $( echo ${VG_LIST} )
+  #	I need a blank line for spacing
+  print
+else
+  # The tool was NOT invoked with "-f" or "-g", so it is
+  #   probably exiting; I need a blank line for spacing
+  print
+fi
+# End of if [[ "${GROUPS}" == 'YES' ]]
+
+###########################
+# Logical Volume Analysis #
+###########################
+# LV analysis on AIX is bass-ackwards (compared to Linux)
+# There does not seem to be a way to simply get a list of LVs; instead,
+#   LV information can only be found through the VG it inhabits
+# So, I loop through each Parent VG and get its list of LVs, then
+#   print out the relevant info for each LV (looks like that will take
+#	  a different "lsvg" call depending on what info I'm putting out)
+# Rather than working off a single list of LVs, I have to process a
+#   small list for each VG
+if [ "${VOLUMES}" == 'YES' ]; then
+  # NOTE: I assume that the AIX storage environment relies on LVM and
+  #       always defines a standard "rootvg" with multiple LVs; this
+  #       means I don't need to bother with determining if there are
+  #       LVs present or worry ahout singular/plural
+  # However, since I can't globally count the number of LVs in a single
+  #   command, I do an initial loop to gather that info
+  LV_NAME_CNT=0
+  for VOL_GROUP in $( echo ${VG_LIST} ); do
+    # Get the count of LVs in this VG - note that I'm concerned with
+    #   LVs that have a "TYPE" of JFS2  *and*  those where the "TYPE"
+    #   is "paging", so I need to construct the "grep" statement to
+    #   account for both, and to use "-w" so I don't also get
+		#   LVs that have a "TYPE" of "jfs2log"
+    VOL_GROUP_LV_COUNT=$( ${VGS_TOOL} -l ${VOL_GROUP} | ${GREP_TOOL} -v 'LV NAME' | ${GREP_TOOL} -c -w -E 'jfs2|paging' )
+    (( LV_NAME_CNT = LV_NAME_CNT + VOL_GROUP_LV_COUNT ))
+  done
+  # I should now have a count of how many LVs are present (at least
+  #   the ones I care about)
+  print "\tThere are ${LV_NAME_CNT} Logical Volumes defined:"
+  print "\t\t\t\t\t\t\tDevices"
+  print "\t\tLogical\t\tLV Size\t  Parent\tUnderlying\tMount"
+  print "\t\tVolume_Name\t(in_GB)\t  __VG__\tThis_LV___\tPoint___________"
+
+  # Dump the LV data to a temp file
+  for VOL_GROUP in $( echo ${VG_LIST} ); do
+    ${VGS_TOOL} -l ${VOL_GROUP} | ${GREP_TOOL} -v 'LV NAME' | ${GREP_TOOL} -w -E 'jfs2|paging' > ${TMP_FILE_A}
+    LOGICAL_VOLUME_LIST=$( ${VGS_TOOL} -l ${VOL_GROUP} | ${GREP_TOOL} -v 'LV NAME' | ${GREP_TOOL} -w -E 'jfs2|paging' | ${AWK_TOOL} '{ print $1 }' | ${TR_TOOL} "\n" " " )
+    # Determine the size (I  *think*  this will always be in MB) of
+    #   the Physical Partitions (PPs) in this Volume Group, so later
+    #   I can calculate the size of a Logical Volume in this VG
+    VOL_GROUP_PP_SIZE=$( ${VGS_TOOL} ${VOL_GROUP} | ${GREP_TOOL} 'PP SIZE:' | ${AWK_TOOL} '{ print $6 }' )
+    VOL_GROUP_PP_SIZE_UNITS=$( ${VGS_TOOL} ${VOL_GROUP} | ${GREP_TOOL} 'PP SIZE:' | ${AWK_TOOL} '{ print $7 }' )
+    # I base my initial calculations on MB units, and I'll convert
+    #   to GB later; so, if the units are NOT in MB, then assume
+    #   they are in GB and adjust the size accordingly
+    if [[ "${VOL_GROUP_PP_SIZE_UNITS}" != 'megabyte(s)' ]]; then
+      (( VOL_GROUP_PP_SIZE = VOL_GROUP_PP_SIZE * 1024 ))
+    fi
+    for LOGICAL_VOLUME in $( echo ${LOGICAL_VOLUME_LIST} ); do
+      DATA_LINE=$( ${GREP_TOOL} -w ${LOGICAL_VOLUME} ${TMP_FILE_A} )
+
+      # How many PVs underlie this LV?
+      LV_SEGMENTS=$( echo ${DATA_LINE} | ${AWK_TOOL} '{ print $5 }' )
+      # If just one, this is easy!
+      if [[ "${LV_SEGMENTS}" -eq 1 ]]; then
+        LV_DEVICE_LIST=$( ${LVS_TOOL} -l ${LOGICAL_VOLUME} | ${GREP_TOOL} -v ${LOGICAL_VOLUME} | ${GREP_TOOL} -v COPIES | ${AWK_TOOL} '{ print $1 }' )
+      else
+        LV_DEVICE_LIST=$( ${LVS_TOOL} -l ${LOGICAL_VOLUME} | ${GREP_TOOL} -v ${LOGICAL_VOLUME} | ${GREP_TOOL} -v COPIES | ${AWK_TOOL} '{ print $1 }' | ${TR_TOOL} "\n" " " )
+      fi
+      if [[ "${DEBUG}" == 'YES' ]]; then
+        print "DEBUG: LV_DEVICE_LIST is ${LV_DEVICE_LIST}"
+        print "DEBUG: LV_SEGMENTS is ${LV_SEGMENTS}"
+      fi
+      # Calculating LV size is a MAJOR pain!
+      # There is no single value - instead, the information is
+      #   scattered; HOWEVER, the size of Physical Partitions (PPs)
+      #   seems to be consistent for all LVs in the VG, and
+      #	I stored that in VOL_GROUP_PP_SIZE above
+      LV_PP_COUNT=$( echo ${DATA_LINE} | ${AWK_TOOL} '{ print $4 }' )
+      # Multiply number of PPs times the size (in MB) of each PP
+      (( LV_SIZE_MB = VOL_GROUP_PP_SIZE * LV_PP_COUNT ))
+      # Express as GB
+      CALC="scale=1;(${LV_SIZE_MB} / 1024)"
+      LV_SIZE=$( echo "${CALC}" | ${CALC_TOOL} -l )
+
+      # If this is a SWAP Volume, then the second field of the
+      #   line will be "paging" and I just use a static word
+      #   as the mount point
+      LV_TYPE=$( echo ${DATA_LINE} | ${AWK_TOOL} '{ print $2 }' )
+      if [[ "${LV_TYPE}" == 'paging' ]]; then
+        LV_MOUNTPOINT='   SWAP'
+      else
+        # Not SWAP, so get the mount point
+        LV_MOUNTPOINT=$( echo ${DATA_LINE} | ${AWK_TOOL} '{ print $7 }' )
+      fi
+
+      # Exactly how I display this depends on if I have
+      #   multiple PVs under this LV
+      if [[ "${LV_SEGMENTS}" -eq 1 ]]; then
+        printf "\t\t%10s\t%5s\t%8s\t%8s\t%s" ${LOGICAL_VOLUME} ${LV_SIZE} ${VOL_GROUP} ${LV_DEVICE_LIST} ${LV_MOUNTPOINT}
+      else
+        LV_DEVICE=$( echo "${LV_DEVICE_LIST}" | ${AWK_TOOL} '{ print $1 }' )
+        printf "\t\t%10s\t%5s\t%8s\t%8s\t%s\n" ${LOGICAL_VOLUME} ${LV_SIZE} ${VOL_GROUP} ${LV_DEVICE} ${LV_MOUNTPOINT}
+        for (( ITERATOR=2 ; ITERATOR<=${LV_SEGMENTS} ; ITERATOR++ )); do
+          LV_DEVICE=$( echo "${LV_DEVICE_LIST}" | ${AWK_TOOL} -v num=${ITERATOR} '{ print $num }' )
+          print "\t\t\t\t\t\t\t  ${LV_DEVICE}"
+        done
+      fi
+      print
+    done
+    # End of for LOGICAL_VOLUME in $( echo ${LOGICAL_VOLUME_LIST} )
+
+    # If the last LV I displayed did NOT have multiple Segments,
+    #   then I need to print a blank line for spacing
+    if [[ "${LV_SEGMENTS}" -eq 1 ]]; then
+      print
+    fi
+  done
+  # End of for VOL_GROUP in $( echo ${VG_LIST} )
+fi
+
+# If not invoked with "-d", clean up temporary files
+if [[ "${DEBUG}" == 'NO' ]]; then
+  ${RM_TOOL} -f ${TMP_FILE_A} 2>&1
+  ${RM_TOOL} -f ${TMP_FILE_B} 2>&1
+fi
+
+# End of aixdiskreport
+######################
