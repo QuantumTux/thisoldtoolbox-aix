@@ -1,0 +1,187 @@
+
+#!/usr/bin/ksh93
+#######################################################################
+# aixpsnet - AIX Process-TCP/IP Port Display Tool
+#######################################################################
+# The purpose of this tool is to gather and display, for each TCP/IP
+#   port which is bound, the process or AIX Kernel Extension binding
+#   to the port; this is somewhat similar to Linux "netstat -anp"
+#
+# REQUIRES:
+#   0) aix_tools.ksh v1.02 or later
+#   1) Privileged Access
+#
+# NOTES:
+#   0) Because AIX does not have a native "grep" that supports context
+#      parameters (such as "-A" and "-B" in GNU "grep"), "nawk" is used
+#      to approximate the same feature if needed
+#   1) The AIX version of "grep" also does not support the "-m"
+#      parameter, so "sed <number>p" is used to emulate that
+#      function if needed
+#   2) The AIX version of "wc" has no way to limit the output to just
+#      just the number of lines in the file, so "awk" must also be used
+#      to trim the output
+#   3) Based on http://www.unixmantra.com/2013/04/determine-which-processes-have-listening-ports-on-aix.html
+#
+# KNOWN BUGS:
+#   0) Temporary files created will not be cleaned up if the script
+#      is killed before completion
+#   1) Does not verify all dependencies
+#
+# TO DO:
+#   0) Add ability to find (not just exclude) specific processes
+#
+TOOL_VERSION='1.00'
+#######################################################################
+# Change Log (Reverse Chronological Order)
+# Who When______ What__________________________________________________
+# dxb 2018-09-10 Initial creation (v1.00)
+#######################################################################
+# Requires minimum aix_tools.ksh
+MINIMUM_AIX_TOOLS_LIBRARY_VERSION=1.00
+TOOLS_FILE='/usr/local/lib/aix_tools.ksh'
+# Make sure it exists, is NOT 0-length, and is a regular file
+if [[ -e ${TOOLS_FILE} && -s ${TOOLS_FILE} && -f ${TOOLS_FILE} ]]; then
+  . ${TOOLS_FILE}
+else
+  print "\nFATAL ERROR: Unable to source a valid tool library (${TOOLS_FILE})\n"
+  exit 1
+fi
+# I should have a valid TOOLS_FILE, so check the file version
+# IMPORTANT: This only works in ksh93, not ksh88 or bash
+if [[ "${AIX_TOOLS_LIBRARY_VERSION}" -lt "${MINIMUM_AIX_TOOLS_LIBRARY_VERSION}" ]]; then
+  print "\nFATAL ERROR: Outdated tool library (${TOOLS_FILE}) - found v${AIX_TOOLS_LIBRARY_VERSION} but need ${MINIMUM_AIX_TOOLS_LIBRARY_VERSION} or later\n"
+  exit 1
+else
+  # Initialize command-shortcut variables
+  _init_script_tool_names
+  # Emulate BASH built-in variables
+  _init_script_variables
+  # Set up variables to colorize text output
+  _init_script_colors
+fi
+
+# Default exit code
+EXIT_CODE=0
+
+# Definition for OUTPUT_MODE
+#   0 - Verbose (all output to stdout)
+#   1 - Quiet (limited output)
+OUTPUT_MODE=0
+
+# Initialize command-line flags
+DEBUG='NO'
+SKIP_ERRORS='NO'
+SKIP_PROCESS=''
+SKIP_KERNEL='NO'
+HELP_FLAG='NO'
+UNKNOWN='NO'
+# Command Line Argument Processing
+while getopts 'p:dekh' OPT; do
+  case ${OPT} in
+    d)  DEBUG='YES'
+        # Also force output to screen
+        OUTPUT_MODE=0
+        ;;
+    e)  SKIP_ERRORS='YES' ;;
+    k)  SKIP_KERNEL='YES' ;;
+    p)  SKIP_PROCESS="${OPTARG}" ;;
+    h)  HELP_FLAG='YES';;
+    *)  UNKNOWN='YES' ;;
+  esac
+done
+
+# Help Screen
+HELP="
+${0} - ${BOLD_TEXT}AIX TCP/IP Port-to-Process Display Tool v${TOOL_VERSION}${ALL_OFF}
+
+\t${BOLD_TEXT}Usage :${ALL_OFF} ${0} [ [ -d ] [ -e ] [ -k ] [ -p <PROCESS_NAME> ] | -h ]${ALL_OFF}
+\t${BOLD_TEXT}Syntax:${ALL_OFF}
+
+\t\t${BOLD_TEXT}-d${ALL_OFF} --> Debug mode; write debugging messages to ${BOLD_TEXT}stdout${ALL_OFF}
+
+\t\t${BOLD_TEXT}-e${ALL_OFF} --> Do NOT display an error message if a PID vanishes during processing
+\t\t\t(This can legitimately occur if a process terminates before it is examined)
+
+\t\t${BOLD_TEXT}-h${ALL_OFF} --> Show this help screen and exit
+
+\t\t${BOLD_TEXT}-k${ALL_OFF} --> Ignore ports bound by a Kernel Extension
+
+\t\t${BOLD_TEXT}-p <PROCESS_NAME>${ALL_OFF} --> Ignore any port bound by a process having this short name
+\t\t\tEXAMPLE: ${BOLD_TEXT}${0} -p sshd${ALL_OFF}
+
+\tArguments are optional
+\t${BOLD_TEXT}Found ${GREEN_BLACK}${TOOLS_FILE}${ALL_OFF} ${BOLD_TEXT}v${AIX_TOOLS_LIBRARY_VERSION}${ALL_OFF}
+"
+
+# Check to see if user is privileged
+# The EUID variable was populated by _init_script_variables
+if [[ "${EUID}" -ne 0 ]]; then
+  print "\n${BOLD_TEXT}${MAGENTA_BLACK}FATAL ERROR:${RED_BLACK} Privilege is required to run this tool${ALL_OFF}\n"
+  HELP_FLAG='YES'
+  EXIT_CODE=1
+else
+  # If not in Quiet Mode and not invoked with "-h", print banner
+  if [[ "${OUTPUT_MODE}" -eq 0 && "${HELP_FLAG}" == 'NO' ]]; then
+    print "${0} - AIX TCP/IP Port-to-Process Display Tool v${SCRIPT_VERSION}"
+    print "\t\t${BOLD_TEXT}${GREEN_BLACK}Privileged status verified!${ALL_OFF}\n"
+  fi
+fi
+
+# If -h argument given, or an unknown/invalid argument was given, display
+#   help screen and exit
+if [[ "${HELP_FLAG}" == 'YES' || "${UNKNOWN}" == 'YES' ]]; then
+  print "${HELP}"
+  exit ${EXIT_CODE}
+fi
+
+# Get the short host name
+THIS_HOSTNAME=$( ${UNAME_TOOL} -n )
+
+###########################
+## Real Work Starts Here ##
+###########################
+if [[ "${OUTPUT_MODE}" -eq 0 ]]; then
+  print "\tChecking TCP/IP Port Bindings on AIX host ${BOLD_TEXT}${THIS_HOSTNAME}${ALL_OFF}"
+fi
+
+print "\n\t${BOLD_TEXT}__Port______    __PID__\t    _Process___${ALL_OFF}"
+DATA_LINE=$( ${NETSTAT_TOOL} -Aan | ${GREP_TOOL} LISTEN | ${AWK_TOOL} '{print $1 "xxx" $5}' | ${TR_TOOL} "\n" " " )
+for PORT_DATA in $( echo "${DATA_LINE}" ); do
+  PCB=$( echo "${PORT_DATA}" | ${AWK_TOOL} -F 'xxx' '{ print $1 }' )
+  PORT=$( echo "${PORT_DATA}" | ${AWK_TOOL} -F 'xxx' '{ print $2 }' )
+  RESULT=$( ${RMSOCK_TOOL} ${PCB} tcpcb )
+  CHKSTR=$( echo "${RESULT}" | ${GREP_TOOL} -c 'Kernel Extension' )
+  if [[ "${CHKSTR}" -eq 1 ]]; then
+    # Am I supposed to ignore Kernel Extensions?
+    if [[ "${SKIP_KERNEL}" == 'YES' ]]; then
+      continue
+    fi
+    OUTPUT=$( printf "%-15s %-16s Kernel Extension" "${PORT}" 'N/A' )
+  else
+    PID=$( echo "${RESULT}" | ${SED_TOOL} -n 's/.*pro[c]*ess \([0-9][0-9]*\) .*/\1/p' )
+    if [[ -n ${PID} ]]; then
+      PROC=$( ${PS_TOOL} -p ${PID} | ${TAIL_TOOL} -n 1 | ${AWK_TOOL} '{ print $4 }' )
+      # Am I supposed to ignore this process?
+      if [[ "${SKIP_PROCESS}" == "${PROC}" ]]; then
+        continue
+      fi
+      OUTPUT=$( printf "%-15s %-16s ${PROC}" "${PORT}" "${PID}" )
+    else
+      # The PID seems to have vanished before I could process it
+      #   Was I asked to skip this type of error?
+      if [[ "${SKIP_ERRORS}" == 'NO' ]]; then
+        OUTPUT="${BOLD_TEXT}${MAGENTA_BLACK}ERROR${ALL_OFF} Unable to process ${BOLD_TEXT}${PORT_DATA}${ALL_OFF}"
+      fi
+    fi
+  fi
+  # End of if [[ "${CHKSTR}" -eq 1 ]]
+  print "\t${OUTPUT}"
+done
+# End of for PORT_DATA in $( echo "${DATA_LINE}" )
+
+# Spacing line
+print
+
+# End of aixpsnet
+#################
