@@ -130,7 +130,7 @@ ${0} - ${BOLD_TEXT}AIX Disk and Logical Volume Reporting Tool v${TOOL_VERSION}${
 
 \tArguments are optional
 \t${BOLD_TEXT}Found ${GREEN_BLACK}${TOOLS_FILE}${ALL_OFF} ${BOLD_TEXT}v${AIX_TOOLS_LIBRARY_VERSION}${ALL_OFF}
-\tPrivilege is required to run this script
+\tPrivilege is required to run this tool
 "
 
 # Check to see if user is privileged
@@ -142,7 +142,7 @@ if [[ "${EUID}" -ne 0 ]]; then
 else
   # If not in Quiet Mode and were not invoked with "-h", print banner
   if [[ "${OUTPUT_MODE}" -eq 0 && "${HELP_FLAG}" == 'NO' ]]; then
-    print "${0} - AIX Disk and Logical Volume Reporting Tool v${SCRIPT_VERSION}"
+    print "${0} - AIX Disk and Logical Volume Reporting Tool v${TOOL_VERSION}"
     print "\t\t${BOLD_TEXT}${GREEN_BLACK}Privileged status verified!${ALL_OFF}\n"
   fi
 fi
@@ -164,7 +164,7 @@ if [[ "${NO_ORPHANS}" == 'YES' && "${QUIET}" == 'YES' ]]; then
 fi
 
 # If invoked with "-q" and it was not cancelled out, then it cancels
-#	  out "-f", "-g" and "-v"
+#   out "-f", "-g" and "-v"
 if [[ "${QUIET}" == 'YES' ]]; then
   FULL='NO'
   GROUPS='NO'
@@ -189,7 +189,7 @@ if [[ "${OUTPUT_MODE}" -eq 0 ]]; then
 fi
 
 # Start by gathering a list of Physical Volumes
-#	By sorting, I guarantee "hdisk0" is the first disk listed, and since
+# By sorting, I guarantee "hdisk0" is the first disk listed, and since
 #   "hdisk0" is universally associated to "rootvg", I ensure that
 #   my list of Volume Groups (VG_LIST) will start with "rootvg"!
 PV_DEVICE_LIST=$( ${PVS_TOOL} | ${SORT_TOOL} -k 1,1 | ${AWK_TOOL} '{ print $1 }' | ${TR_TOOL} "\n" " " )
@@ -260,13 +260,13 @@ fi
 #           using the loop above, because it is possible for a VG to
 #           be associated with multiple PVs
 # I get the list of defined VGs now, and I make sure that universal
-#	  "rootvg" is the first one in the list
+#   "rootvg" is the first one in the list
 VG_LIST=$( ${VGS_TOOL} | ${GREP_TOOL} -v rootvg | ${TR_TOOL} "\n" " " )
 VG_LIST="rootvg ${VG_LIST}"
 
 # At this point, VG_LIST is populated with a list of all the defined
-#	  Volume Groups, and my sort of PVs above means that "rootvg"
-#	  should always be the first VG in the list
+#   Volume Groups, and my sort of PVs above means that "rootvg"
+#   should always be the first VG in the list
 
 #########################
 # Volume Group Analysis #
@@ -335,7 +335,7 @@ fi
 #   LV information can only be found through the VG it inhabits
 # So, I loop through each Parent VG and get its list of LVs, then
 #   print out the relevant info for each LV (looks like that will take
-#	  a different "lsvg" call depending on what info I'm putting out)
+#   a different "lsvg" call depending on what info I'm putting out)
 # Rather than working off a single list of LVs, I have to process a
 #   small list for each VG
 if [ "${VOLUMES}" == 'YES' ]; then
@@ -351,7 +351,7 @@ if [ "${VOLUMES}" == 'YES' ]; then
     #   LVs that have a "TYPE" of JFS2  *and*  those where the "TYPE"
     #   is "paging", so I need to construct the "grep" statement to
     #   account for both, and to use "-w" so I don't also get
-		#   LVs that have a "TYPE" of "jfs2log"
+    #   LVs that have a "TYPE" of "jfs2log"
     VOL_GROUP_LV_COUNT=$( ${VGS_TOOL} -l ${VOL_GROUP} | ${GREP_TOOL} -v 'LV NAME' | ${GREP_TOOL} -c -w -E 'jfs2|paging' )
     (( LV_NAME_CNT = LV_NAME_CNT + VOL_GROUP_LV_COUNT ))
   done
