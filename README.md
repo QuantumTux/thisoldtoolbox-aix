@@ -33,7 +33,7 @@ This tool is designed to gather and distill the storage configuration on an AIX 
 <details>
 <summary>Read more about aixdiskreport</summary>
   
-Coming from the Linux world, I found the AIX approach to logical volume mangement fairly understandable. I didn't like how difficult it was to figure out storage units, and I think hard-coded names like **rootvg** are silly, but I still understood it. This tool is based off of a similar tool I wrote for the Linux environment.
+Coming from the Linux world, I found the AIX approach to logical volume management fairly understandable. I didn't like how difficult it was to figure out storage units, and I think hard-coded names like **rootvg** are silly, but I still understood it. This tool is based off of a similar tool I wrote for the Linux environment.
 
 Only storage devices managed as Physical Volumes are detected and reported by this tool.
 
@@ -41,20 +41,20 @@ Only storage devices managed as Physical Volumes are detected and reported by th
 
 ## aixnetreport
 
-Based on my **ethreport** tool from Linux, this tool tries to do something similar in AIX.
+Based on my **ethreport** tool from Linux, this tool does something similar in AIX.
 
 <details>
 <summary>Read more about aixnetreport</summary>
   
   While I could figure out storage in the AIX world, I found the networking component of AIX obtuse and needlessly complex. I don't understand the reason behind **ent** *vs* **en** devices.
 
-  I also found it astonishing that AIX didn't support detecting Link State until AIX 7.1.3.3, and it still required setting a specific attribute on the LPAR interface.
+  I also found it astonishing that AIX didn't support detecting Link State until AIX 7.1.3.3, and even then it still required setting a specific attribute on the LPAR interface.
 
 </details>
 
 ## aixopenf
 
-AIX didn't seem to have equivalent of the **lsof** tool in Linux.
+AIX didn't seem to have equivalent of the **lsof** tool in Linux, so I created this.
 
 <details>
 <summary>Read more about aixopenf</summary>
