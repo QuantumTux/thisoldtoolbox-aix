@@ -65,7 +65,7 @@ AIX didn't seem to have equivalent of the **lsof** tool in Linux.
 
 ## aixpsnet
 
-Another Linux tool missing from AIX is **netstat**.
+Another Linux tool missing from AIX is **netstat** (or, more precisely, some of the functionality of the Linux tool is missing from the AIX tool bearing the same name)
 
 <details>
 <summary>Read more about aixpsnet</summary>
