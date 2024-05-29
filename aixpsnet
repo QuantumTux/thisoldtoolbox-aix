@@ -8,7 +8,7 @@
 #   to the port; this is somewhat similar to Linux "netstat -anp"
 #
 # REQUIRES:
-#   0) aix_tools.ksh v1.02 or later
+#   0) aix_tools.ksh v1.00 or later
 #   1) Privileged Access
 #
 # NOTES:
@@ -24,7 +24,7 @@
 #   3) Based on http://www.unixmantra.com/2013/04/determine-which-processes-have-listening-ports-on-aix.html
 #
 # KNOWN BUGS:
-#   0) Temporary files created will not be cleaned up if the script
+#   0) Temporary files created will not be cleaned up if the tool
 #      is killed before completion
 #   1) Does not verify all dependencies
 #
@@ -123,7 +123,7 @@ if [[ "${EUID}" -ne 0 ]]; then
 else
   # If not in Quiet Mode and not invoked with "-h", print banner
   if [[ "${OUTPUT_MODE}" -eq 0 && "${HELP_FLAG}" == 'NO' ]]; then
-    print "${0} - AIX TCP/IP Port-to-Process Display Tool v${SCRIPT_VERSION}"
+    print "${0} - AIX TCP/IP Port-to-Process Display Tool v${TOOL_VERSION}"
     print "\t\t${BOLD_TEXT}${GREEN_BLACK}Privileged status verified!${ALL_OFF}\n"
   fi
 fi

@@ -16,7 +16,7 @@
 #       multiple invocations to extract specific information
 #   1) Link Status detection requires AIX 7.1 TL3 or later, and
 #       also requires that specific support has been enabled
-#	      in the OS; see https://www.ibm.com/developerworks/community/blogs/cgaix/entry/use_entstat_to_view_aix_virtual_ethernet_link_status?lang=en_us
+#       in the OS; see https://www.ibm.com/developerworks/community/blogs/cgaix/entry/use_entstat_to_view_aix_virtual_ethernet_link_status?lang=en_us
 #   2) Does not detect or analyze "etX" interfaces (those using
 #       802.3 instead of standard Ethernet)
 #
@@ -243,7 +243,7 @@ case "${AIX_VERSION}" in
 
         # IMPORTANT: There is one final check - is "poll_uplink"
         #             enabled?
-        #	So, even if I have AIX 7.1.3.3 or later, if that
+        # So, even if I have AIX 7.1.3.3 or later, if that
         #   attribute is not set to "yes" on the interfaces, then I
         #   still cannot determine Link State
         # I will check this when processing each interface
