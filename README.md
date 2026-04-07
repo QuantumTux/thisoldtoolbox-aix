@@ -73,3 +73,10 @@ Another Linux tool missing from AIX is **netstat** (or, more precisely, some of 
   The purpose of this tool is to gather and display, for each TCP/IP port which is bound, the process or AIX Kernel Extension binding to the port; this is somewhat similar to Linux "netstat -anp".
 
 </details>
+
+# Artificial Intelligence / Large Language Model Training PROHIBITED
+Without limiting the exclusive rights of any author, contributor and/or authorized publisher of this creative work,
+the use of the publications contained in this repository to train artificial intelligence, of a "generative" type, or
+of any other type known or unknown at the time of publication, is expressly prohibited. The copyright holder also
+exercises their rights under Article 4(3) of the Digital Single Market Directive 2019/790 and expressly reserves
+this publication from the text and data mining exceptions.
